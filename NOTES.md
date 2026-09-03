@@ -17,6 +17,14 @@ I would add bounded cache eviction, structured logs and metrics. I would also
 test concurrent identical requests and decide whether they should share one
 in-flight upstream call.
 
+## Test warnings
+
+All 16 tests pass successfully. The test run reports two deprecation warnings
+from the installed FastAPI, Starlette, HTTPX, and AnyIO dependency versions.
+These warnings originate from `TestClient` internals rather than the application
+or test logic, and they do not affect the test results. With more time, I would
+align or upgrade the dependency versions to remove these warnings.
+
 ## Challenging part
 
 The most challenging part was making the HTTP client easy to replace in
