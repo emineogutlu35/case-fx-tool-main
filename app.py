@@ -3,362 +3,283 @@ from __future__ import annotations
 import os
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-
-# Create the API app.
+# Create the FastAPI application.
 app = FastAPI(title="FX Conversion Tool", version="1.0.0")
 
-
-# Set the first valid date and wait time.
+# Read the API address from the environment.
+UPSTREAM_BASE = os.getenv(
+    "FX_UPSTREAM_BASE",
+    "https://api.frankfurter.dev",
+).rstrip("/")
+UPSTREAM_TIMEOUT = 3.0
 ECB_SERIES_START = date(1999, 1, 4)
-UPSTREAM_TIMEOUT_SECONDS = 3.0
 
 
-# Save old rates here.
-_rate_cache: dict[tuple[str, str, str], tuple[Decimal, str]] = {}
+# Describe the data stored in the cache.
+class CachedRate(TypedDict):
+    rate: Decimal
+    rate_date: str
 
 
-# Create a custom error.
-class ServiceError(Exception):
-    """An error that can safely be returned to the API caller."""
-
-    def __init__(
-        self,
-        status_code: int,
-        error: str,
-        message: str,
-    ) -> None:
-        self.status_code = status_code
-        self.error = error
-        self.message = message
-        super().__init__(message)
+# Store validated rates in memory.
+_rate_cache: dict[tuple[str, str, str], CachedRate] = {}
 
 
-# Send custom errors as JSON.
-@app.exception_handler(ServiceError)
-async def handle_service_error(
-    request: Request,
-    exc: ServiceError,
-) -> JSONResponse:
+# Create the standard error response.
+def error_response(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": exc.error,
-            "message": exc.message,
-        },
+        status_code=status_code,
+        content={"error": code, "message": message},
     )
 
 
-# Send an error for wrong input.
+# Return a simple error for invalid query parameters.
 @app.exception_handler(RequestValidationError)
-async def handle_validation_error(
+async def validation_error_response(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
-    return JSONResponse(
-        status_code=422,
-        content={
-            "error": "invalid_request",
-            "message": (
-                "The request is missing a required parameter or contains "
-                "an invalid value."
-            ),
-        },
+    return error_response(
+        422,
+        "invalid_request",
+        "The request is missing a required parameter or contains an invalid value.",
     )
 
 
-# Get the rate API address.
-def get_upstream_base() -> str:
-    """Read the upstream URL from the environment."""
-
-    return os.getenv(
-        "FX_UPSTREAM_BASE",
-        "https://api.frankfurter.dev",
-    ).rstrip("/")
-
-
-# Check the currency code.
-def validate_currency(currency: str) -> str:
-    """Normalize and perform basic validation on a currency code."""
-
-    normalized = currency.strip().upper()
-
-    if len(normalized) != 3 or not normalized.isalpha():
-        raise ServiceError(
-            status_code=400,
-            error="unsupported_currency",
-            message=f"'{currency}' is not a supported currency code.",
-        )
-
-    return normalized
-
-
-# Check the money amount.
-def validate_amount(amount: Decimal) -> None:
-    """Require a positive monetary amount with at most two decimal places."""
-
-    # The amount must be more than zero.
-    if not amount.is_finite() or amount <= 0:
-        raise ServiceError(
-            status_code=400,
-            error="invalid_amount",
-            message="Amount must be greater than zero.",
-        )
-
-    decimal_places = max(0, -amount.as_tuple().exponent)
-
-    # Use no more than two decimal places.
-    if decimal_places > 2:
-        raise ServiceError(
-            status_code=400,
-            error="amount_precision",
-            message="Amount may have at most two decimal places.",
-        )
-
-
-# Check the data from the rate API.
+# Check the data returned by the upstream API.
 def parse_upstream_payload(
     payload: Any,
-    target_currency: str,
+    to_currency: str,
     asked_date: date,
-) -> tuple[Decimal, str]:
-    """Validate the upstream response and extract its rate and real date."""
-
-    # The data must be an object.
+) -> tuple[Decimal, str] | JSONResponse:
+    # The response must be a JSON object.
     if not isinstance(payload, dict):
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned an invalid response.",
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned an invalid response.",
         )
 
     rate_date_value = payload.get("date")
     rates = payload.get("rates")
 
-    # Check the date and rates.
+    # The response must contain a date and a rates object.
     if not isinstance(rate_date_value, str) or not isinstance(rates, dict):
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned an invalid response.",
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned an invalid response.",
         )
 
-    # Change the date text to a date object.
+    # Change the date text into a date object.
     try:
-        rate_date = date.fromisoformat(rate_date_value)
-    except ValueError as exc:
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned an invalid rate date.",
-        ) from exc
-
-    # The rate date cannot be later.
-    if rate_date > asked_date:
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned a rate from a later date.",
+        parsed_rate_date = date.fromisoformat(rate_date_value)
+    except ValueError:
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned an invalid rate date.",
         )
 
-    # Get the wanted rate.
-    raw_rate = rates.get(target_currency)
-
-    if raw_rate is None:
-        raise ServiceError(
-            status_code=400,
-            error="unsupported_currency",
-            message=f"'{target_currency}' is not a supported currency code.",
+    # Never use a rate from a later date.
+    if parsed_rate_date > asked_date:
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned a rate from a later date.",
         )
 
-    # Change the rate to Decimal.
+    # The target currency must exist in the response.
+    if to_currency not in rates:
+        return error_response(
+            400,
+            "unsupported_currency",
+            f"'{to_currency}' is not a supported currency code.",
+        )
+
+    # Use Decimal to keep the rate accurate.
     try:
-        rate = Decimal(str(raw_rate))
-    except (InvalidOperation, ValueError) as exc:
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned an invalid rate.",
-        ) from exc
+        rate = Decimal(str(rates[to_currency]))
+    except (InvalidOperation, TypeError, ValueError):
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned an invalid rate.",
+        )
 
-    # The rate must be more than zero.
+    # The rate must be a positive, normal number.
     if not rate.is_finite() or rate <= 0:
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned an invalid rate.",
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned an invalid rate.",
         )
 
-    return rate, rate_date.isoformat()
+    return rate, parsed_rate_date.isoformat()
 
 
-# Get the rate from memory or the rate API.
+# Get a rate from the cache or the upstream API.
 async def fetch_rate(
-    base_currency: str,
-    target_currency: str,
     asked_date: date,
-) -> tuple[Decimal, str]:
-    """Fetch and validate one historical exchange rate."""
+    from_currency: str,
+    to_currency: str,
+) -> tuple[Decimal, str] | JSONResponse:
+    # Include the date and both currencies in the cache key.
+    cache_key = (asked_date.isoformat(), from_currency, to_currency)
+    cached = _rate_cache.get(cache_key)
 
-    # Create a key for this rate.
-    cache_key = (
-        asked_date.isoformat(),
-        base_currency,
-        target_currency,
-    )
+    # Return the saved rate when it exists.
+    if cached is not None:
+        return cached["rate"], cached["rate_date"]
 
-    # Use the saved rate if it exists.
-    cached_rate = _rate_cache.get(cache_key)
+    # Build the URL from the configured base address.
+    url = f"{UPSTREAM_BASE}/v1/{asked_date.isoformat()}"
 
-    if cached_rate is not None:
-        return cached_rate
-
-    # Create the request address.
-    url = f"{get_upstream_base()}/v1/{asked_date.isoformat()}"
-
-    # Ask the rate API for the rate.
+    # Call the upstream API with a timeout.
     try:
-        async with httpx.AsyncClient(
-            timeout=UPSTREAM_TIMEOUT_SECONDS,
-        ) as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             response = await client.get(
                 url,
-                params={
-                    "base": base_currency,
-                    "symbols": target_currency,
-                },
+                params={"base": from_currency, "symbols": to_currency},
             )
-    except httpx.TimeoutException as exc:
-        raise ServiceError(
-            status_code=503,
-            error="upstream_unavailable",
-            message="The exchange-rate provider did not respond in time.",
-        ) from exc
-    except httpx.RequestError as exc:
-        raise ServiceError(
-            status_code=503,
-            error="upstream_unavailable",
-            message="The exchange-rate provider is currently unavailable.",
-        ) from exc
-
-    # Check errors from the rate API.
-    if response.status_code >= 500:
-        raise ServiceError(
-            status_code=502,
-            error="upstream_error",
-            message="The exchange-rate provider returned a server error.",
+    except httpx.TimeoutException:
+        return error_response(
+            503,
+            "upstream_unavailable",
+            "The exchange-rate provider did not respond in time.",
+        )
+    except httpx.RequestError:
+        return error_response(
+            503,
+            "upstream_unavailable",
+            "The exchange-rate provider is currently unavailable.",
         )
 
-    if response.status_code in {400, 422}:
-        raise ServiceError(
-            status_code=400,
-            error="unsupported_currency",
-            message="One or both currency codes are not supported.",
+    # Check the HTTP status.
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        if response.status_code in {400, 422}:
+            return error_response(
+                400,
+                "unsupported_currency",
+                "One or both currency codes are not supported.",
+            )
+        if response.status_code == 404:
+            return error_response(
+                404,
+                "rate_not_available",
+                "No exchange rate is available for the requested date.",
+            )
+        return error_response(
+            502,
+            "upstream_error",
+            "The exchange-rate provider returned an error.",
         )
 
-    if response.status_code == 404:
-        raise ServiceError(
-            status_code=404,
-            error="rate_not_available",
-            message="No exchange rate is available for the requested date.",
-        )
-
-    if not 200 <= response.status_code < 300:
-        raise ServiceError(
-            status_code=502,
-            error="upstream_error",
-            message="The exchange-rate provider returned an unexpected error.",
-        )
-
-    # Read the answer as JSON.
+    # Read the response as JSON.
     try:
         payload = response.json()
-    except ValueError as exc:
-        raise ServiceError(
-            status_code=502,
-            error="invalid_upstream_response",
-            message="The exchange-rate provider returned non-JSON content.",
-        ) from exc
+    except ValueError:
+        return error_response(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned non-JSON content.",
+        )
 
-    # Get the rate and date.
-    rate, rate_date = parse_upstream_payload(
-        payload=payload,
-        target_currency=target_currency,
-        asked_date=asked_date,
-    )
+    # Validate the JSON data.
+    parsed = parse_upstream_payload(payload, to_currency, asked_date)
+    if isinstance(parsed, JSONResponse):
+        return parsed
 
-    # Save the rate for later.
-    _rate_cache[cache_key] = (rate, rate_date)
+    rate, rate_date = parsed
 
+    # Save only validated data in the cache.
+    _rate_cache[cache_key] = {"rate": rate, "rate_date": rate_date}
     return rate, rate_date
 
 
-# Create the money change endpoint.
-@app.get("/tools/convert")
+# Create the currency conversion endpoint.
+@app.get("/tools/convert", response_model=None)
 async def convert(
     amount: Decimal,
     from_currency: str = Query(alias="from"),
     to_currency: str = Query(alias="to"),
     asked_date: date = Query(alias="date"),
-) -> dict[str, object]:
-    """Convert an amount using an ECB exchange rate."""
+) -> dict[str, object] | JSONResponse:
+    # Normalize currency codes.
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
 
-    # Check the user input.
-    validate_amount(amount)
+    # The amount must be greater than zero.
+    if not amount.is_finite() or amount <= 0:
+        return error_response(400, "invalid_amount", "Amount must be greater than zero.")
 
-    base_currency = validate_currency(from_currency)
-    target_currency = validate_currency(to_currency)
-
-    # The two currencies cannot be the same.
-    if base_currency == target_currency:
-        raise ServiceError(
-            status_code=400,
-            error="same_currency",
-            message="Source and target currencies must be different.",
+    # The amount can have at most two decimal places.
+    if amount.as_tuple().exponent < -2:
+        return error_response(
+            400,
+            "amount_precision",
+            "Amount may have at most two decimal places.",
         )
-
-    today = date.today()
 
     # The date cannot be in the future.
-    if asked_date > today:
-        raise ServiceError(
-            status_code=400,
-            error="future_date",
-            message="The requested date cannot be in the future.",
+    if asked_date > date.today():
+        return error_response(
+            400,
+            "future_date",
+            "The requested date cannot be in the future.",
         )
 
-    # The date cannot be too old.
+    # The date must be inside the ECB series.
     if asked_date < ECB_SERIES_START:
-        raise ServiceError(
-            status_code=400,
-            error="date_before_series",
-            message="The requested date is before the ECB rate series began.",
+        return error_response(
+            400,
+            "date_before_series",
+            "The requested date is before the ECB exchange-rate series began.",
         )
+
+    # The currencies must be different.
+    if from_currency == to_currency:
+        return error_response(
+            400,
+            "same_currency",
+            "Source and target currencies must be different.",
+        )
+
+    # Currency codes must contain three ASCII letters.
+    for currency in (from_currency, to_currency):
+        if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+            return error_response(
+                400,
+                "unsupported_currency",
+                f"'{currency}' is not a supported currency code.",
+            )
 
     # Get the exchange rate.
-    rate, rate_date = await fetch_rate(
-        base_currency=base_currency,
-        target_currency=target_currency,
-        asked_date=asked_date,
-    )
+    fetched = await fetch_rate(asked_date, from_currency, to_currency)
+    if isinstance(fetched, JSONResponse):
+        return fetched
 
+    rate, rate_date = fetched
     # Calculate and round the result.
     result = (amount * rate).quantize(
         Decimal("0.01"),
         rounding=ROUND_HALF_UP,
     )
 
-    # Send the result as JSON.
+    # Return the successful response.
     return {
         "amount": float(amount),
-        "from": base_currency,
-        "to": target_currency,
+        "from": from_currency,
+        "to": to_currency,
         "rate": float(rate),
         "result": float(result),
         "rate_date": rate_date,
