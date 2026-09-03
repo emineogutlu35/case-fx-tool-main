@@ -32,6 +32,11 @@ class CachedRate(TypedDict):
 _rate_cache: dict[tuple[str, str, str], CachedRate] = {}
 
 
+# Create the HTTP client in one place so tests can replace it.
+def create_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT)
+
+
 # Create the standard error response.
 def error_response(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
@@ -144,7 +149,7 @@ async def fetch_rate(
 
     # Call the upstream API with a timeout.
     try:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+        async with create_http_client() as client:
             response = await client.get(
                 url,
                 params={"base": from_currency, "symbols": to_currency},
